@@ -113,6 +113,11 @@ int32_t bt_service_start()
     return ret;
 }
 
+// int32_t bt_service_stop()
+// {
+
+// }
+
 static void bt_ready(int err)
 {
     LOG_INF("Bluetooth ready");

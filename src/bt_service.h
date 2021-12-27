@@ -4,5 +4,6 @@
 #include <stdint.h>
 
 int32_t bt_service_start();
+// int32_t bt_service_stop();
 
 #endif
