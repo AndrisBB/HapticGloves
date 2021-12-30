@@ -6,5 +6,6 @@ find_package(Zephyr)
 project(nrf52_haptic)
 
 target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE src/event_loop.c)
 target_sources(app PRIVATE src/bt_service.c)
 target_sources(app PRIVATE src/system_state.c)

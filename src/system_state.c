@@ -6,15 +6,17 @@
 #include <drivers/gpio.h>
 #include <pm/pm.h>
 #include <logging/log.h>
-#include <smf.h>
 
 #include <string.h>
 
 #include <hal/nrf_gpio.h>
 
-#define BTN_PRESSED 0
-#define BTN_TICKS_THRESHOLD_EXIT_RESET  20
-#define BTN_TICKS_THRESHOLD_SYSTEM_OFF  30
+#define BTN_PRESSED                     0
+#define BTN_RELEASED                    1
+#define SYSTEM_ON_THRESHOLD_MS          2000
+#define PAIRING_THRESHOLD_MS            4000
+
+#define BUTTON_GPIO_PIN                 DT_GPIO_PIN(DT_ALIAS(sw1), gpios)
 
 LOG_MODULE_REGISTER(state);
 
@@ -30,16 +32,6 @@ enum system_state
     CONNECTED
 };
 
-static struct s_object 
-{
-    struct smf_ctx ctx;
-    const struct device *dev_led;
-    const struct device *dev_btn;
-
-    uint32_t btn_down_ticks;
-} 
-s_obj;
-
 // ------------------------------------------------------
 //   DEEP_SLEEP state
 // ------------------------------------------------------
@@ -47,7 +39,7 @@ static void deep_sleep_entry(void *o)
 {
     LOG_INF("%s", __func__);
 
-    struct s_object *state = (struct s_object *)o;
+    state_t *state = (state_t *)o;
     if((state->dev_btn == NULL) || (state->dev_led == NULL)){
         LOG_WRN("Woops, something not right:%s", __func__);
         return;
@@ -65,7 +57,7 @@ static void deep_sleep_entry(void *o)
 
 static void deep_sleep_run(void *o)
 {
-    LOG_INF("%s: Should go sleep after this", __func__);
+    LOG_INF("%s: Should go to sleep after this", __func__);
 }
 
 static void deep_sleep_exit(void *o)
@@ -81,7 +73,7 @@ static void reset_entry(void *o)
 {
     LOG_INF("%s", __func__);
 
-    struct s_object *state = (struct s_object *)o;
+    state_t *state = (state_t *)o;
     if((state->dev_btn == NULL) || (state->dev_led == NULL)){
         LOG_WRN("Woops, something not right:%s", __func__);
         return;
@@ -92,40 +84,60 @@ static void reset_entry(void *o)
 
     // Check if btn is still down, might be some glich or something or
     // power could be just connected.
-    int32_t btn_state = gpio_pin_get(state->dev_btn, DT_GPIO_PIN(DT_ALIAS(sw1), gpios));
+    int32_t btn_state = gpio_pin_get(state->dev_btn, BUTTON_GPIO_PIN);
     if(btn_state != BTN_PRESSED) {
         LOG_INF("%s: Button is not pressed, going into DEEP SLEEP", __func__);
         smf_set_state(SMF_CTX(state), &system_states[DEEP_SLEEP]);
     }
 
-    state->btn_down_ticks = 0;
+    state->pending_pairing = 0;
 }
+
 static void reset_run(void *o)
 {
-    LOG_INF("%s", __func__);
+    LOG_INF("%s called", __func__);
 
-    struct s_object *state = (struct s_object *)o;
+    enum system_state next_state = RESET;
+
+    state_t *state = (state_t *)o;
+    event_t *evt = state->evt;
+    
     if((state->dev_btn == NULL) || (state->dev_led == NULL)){
         LOG_WRN("Woops, something not right:%s", __func__);
         return;
     }
 
-    int32_t btn_state = gpio_pin_get(state->dev_btn, DT_GPIO_PIN(DT_ALIAS(sw1), gpios));
-    if(btn_state == BTN_PRESSED) {
-        state->btn_down_ticks++;
-    }
-    else {
-        // If we are in the RESET state and button is UP, then
-        // switch pack to DEEP SLEEP
-        smf_set_state(SMF_CTX(state), &system_states[DEEP_SLEEP]);
+    if(evt->_event_type == EVENT_KEY) {
+        key_event_t *key_event = (key_event_t *)evt;
+
+        LOG_INF("Handle key event. Key state:%u", key_event->key_state);
+
+        if(key_event->key_state == BTN_RELEASED) {
+            uint32_t up_time = k_uptime_get_32();
+
+            LOG_INF("Kernel uptime:%u", up_time);
+
+            if(up_time >= SYSTEM_ON_THRESHOLD_MS) {
+                LOG_INF("Reached system ON threshold");
+                next_state = ADVERTISE;
+            }
+            else {
+                next_state = DEEP_SLEEP;
+            }
+
+            if(up_time >= PAIRING_THRESHOLD_MS) {
+                state->pending_pairing = 1;
+            }
+        }
     }
 
-    if(state->btn_down_ticks >= BTN_TICKS_THRESHOLD_EXIT_RESET) {
-        LOG_INF("Turning device full on");
-        smf_set_state(SMF_CTX(state), &system_states[ADVERTISE]);
+    if(next_state != RESET) {
+        smf_set_state(SMF_CTX(state), &system_states[next_state]);
     }
 
+    LOG_INF("%s completed", __func__);
 }
+
 static void reset_exit(void *o)
 {
     LOG_INF("%s", __func__);
@@ -138,7 +150,7 @@ static void advertise_entry(void *o)
 {
     LOG_INF("%s", __func__);
 
-    struct s_object *state = (struct s_object *)o;
+    state_t *state = (state_t *)o;
     if((state->dev_btn == NULL) || (state->dev_led == NULL)){
         LOG_WRN("Woops, something not right:%s", __func__);
         return;
@@ -146,37 +158,39 @@ static void advertise_entry(void *o)
 
     // Turn status LED ON
     gpio_pin_set(state->dev_led, DT_GPIO_PIN(DT_ALIAS(led0), gpios), 1);
+
+    LOG_INF("Pending pairing:%u", state->pending_pairing);
 }
 
 static void advertise_run(void *o)
 {
-    struct s_object *state = (struct s_object *)o;
+    LOG_INF("%s", __func__);
+
+    state_t *state = (state_t *)o;
     if((state->dev_btn == NULL) || (state->dev_led == NULL)){
         LOG_WRN("Woops, something not right:%s", __func__);
         return;
     }
 
-    int32_t btn_state = gpio_pin_get(state->dev_btn, DT_GPIO_PIN(DT_ALIAS(sw1), gpios));
+    // int32_t btn_state = gpio_pin_get(state->dev_btn, DT_GPIO_PIN(DT_ALIAS(sw1), gpios));
 
-    if(btn_state == BTN_PRESSED) {
-        state->btn_down_ticks++;
-    }
-    else {
-        state->btn_down_ticks = 0;
-    }
+    // if(btn_state == BTN_PRESSED) {
+    //     state->btn_down_ticks++;
+    // }
+    // else {
+    //     state->btn_down_ticks = 0;
+    // }
 
-    if(state->btn_down_ticks >= BTN_TICKS_THRESHOLD_SYSTEM_OFF) {
-        LOG_INF("%s: Reached SYSTEM_OFF threshold", __func__);
-        smf_set_state(SMF_CTX(state), &system_states[DEEP_SLEEP]);
-    }
+    // if(state->btn_down_ticks >= BTN_TICKS_THRESHOLD_SYSTEM_OFF) {
+    //     LOG_INF("%s: Reached SYSTEM_OFF threshold", __func__);
+    //     smf_set_state(SMF_CTX(state), &system_states[DEEP_SLEEP]);
+    // }
 }
 
 static void advertise_exit(void *o)
 {
     LOG_INF("%s", __func__);
 }
-
-
 
 static const struct smf_state system_states[] = 
 {
@@ -185,26 +199,36 @@ static const struct smf_state system_states[] =
     [ADVERTISE]     = SMF_CREATE_STATE(advertise_entry, advertise_run, advertise_exit)
 };
 
-int32_t state_init()
+int32_t state_init(state_t *state)
 {
-    s_obj.dev_led = device_get_binding(DT_GPIO_LABEL(DT_ALIAS(led0), gpios));
-    if(s_obj.dev_led == NULL) {
+    int32_t ret = 0;
+
+    state->dev_led = device_get_binding(DT_GPIO_LABEL(DT_ALIAS(led0), gpios));
+    if(state->dev_led == NULL) {
         LOG_ERR("LED0 device is NULL");
         return -1;
     }
 
-    s_obj.dev_btn = device_get_binding(DT_GPIO_LABEL(DT_ALIAS(sw1), gpios));
-    if(s_obj.dev_btn == NULL) {
+    state->dev_btn = device_get_binding(DT_GPIO_LABEL(DT_ALIAS(sw1), gpios));
+    if(state->dev_btn == NULL) {
         LOG_ERR("BTN device is NULL");
         return -1;
     }
 
-    smf_set_initial(SMF_CTX(&s_obj), &system_states[RESET]);
+    ret = gpio_pin_interrupt_configure(state->dev_btn, BUTTON_GPIO_PIN, GPIO_INT_EDGE_BOTH);
+    if(ret != 0) {
+        LOG_ERR("%s: Failed to initialize button IRQ", __func__);
+        return -1;
+    }
+
+    smf_set_initial(SMF_CTX(state), &system_states[RESET]);
 
     return 0;
 }
 
-int32_t state_update()
+int32_t state_update(state_t *state, event_t *evt)
 {
-    return smf_run_state(SMF_CTX(&s_obj));
+    state->evt = evt;
+
+    return smf_run_state(SMF_CTX(state));
 }
